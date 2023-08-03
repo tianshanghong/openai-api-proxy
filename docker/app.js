@@ -7,6 +7,13 @@ app.use(forms.array());
 const cors = require('cors');
 app.use(cors());
 
+const Redis = require('ioredis');
+const redis = new Redis({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: process.env.REDIS_PORT || 6379,
+});
+const {encode} = require('gpt-3-encoder')
+
 const bodyParser = require('body-parser')
 app.use(bodyParser.json({limit : '50mb' }));  
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -36,6 +43,41 @@ app.all(`*`, async (req, res) => {
   // 从 header 中取得 Authorization': 'Bearer 后的 token
   const token = req.headers.authorization?.split(' ')[1];
   if( !token ) return res.status(403).send('Forbidden');
+
+  const request_ts = new Date().getTime();
+  const hashed_code = req.headers.code? req.headers.code : "";
+  const model = req.body?.model || "unknown";
+  const gpt4_forbidden_msg = process.env.GPT4_FORBIDDEN_MSG || "GPT-4 API access forbidden";
+
+  let req_token_count = 0;
+  let resp_token_count = 0;
+
+  // Block the gpt4 api if no hashed code is provided or the hashed code is md5 of empty string (d41d8cd98f00b204e9800998ecf8427e)
+  if( model.startsWith("gpt-4") && (!hashed_code || hashed_code === "d41d8cd98f00b204e9800998ecf8427e") ) {
+    return res.status(403).send(gpt4_forbidden_msg);
+  }
+  
+  // save request token count to redis
+  const messages = req.body?.messages || [];
+  const countTokensInContent = (messages) => {
+    return messages.reduce((total, message) => {
+        if (message.content && typeof message.content === 'string') {
+            const encoded = encode(message.content)
+            return total + encoded.length;
+        } else {
+            return total;
+        }
+    }, 0);
+  };
+  req_token_count = countTokensInContent(messages);
+  // console.log("req_token_count", req_token_count, messages);
+  redis.set(`${hashed_code}:${model}:${request_ts}:req_token`, req_token_count, (err, result) => {
+    if (err) {
+      console.error('Error writing data to Redis', err);
+    } else {
+      // console.log('Successfully wrote data to Redis', result);
+    }
+  });
 
   const openai_key = process.env.OPENAI_KEY||token.split(':')[0];
   if( !openai_key ) return res.status(403).send('Forbidden');
@@ -167,8 +209,26 @@ app.all(`*`, async (req, res) => {
               // 因为开头已经处理的了 [DONE] 的情况，这里应该不会出现无法解析json的情况 
               console.log( "error", error );
             }   
-          }else
-          {
+          } else if (hashed_code && hashed_code.length > 0) {
+            try {
+              let data_array = JSON.parse(data);
+              const char = data_array.choices[0]?.delta?.content? data_array.choices[0].delta.content : "";
+              const encoded = encode(char) 
+              resp_token_count += encoded? encoded.length : 0;
+              
+              redis.set(`${hashed_code}:${model}:${request_ts}:resp_token`, resp_token_count, (err, result) => {
+                if (err) {
+                  console.error('Error writing data to Redis', err);
+                } else {
+                  // console.log('Successfully wrote data to Redis', result);
+                }
+              });
+              res.write("data: "+data+"\n\n" );
+            } catch (error) {
+              // 因为开头已经处理的了 [DONE] 的情况，这里应该不会出现无法解析json的情况 
+              console.log( "error", error );
+            } 
+          } else {
             // 如果没有文本审核参数或者设置，直接输出
             res.write("data: "+data+"\n\n" );  
           }
