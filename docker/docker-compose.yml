@@ -5,7 +5,8 @@ services:
     ports:
       - "6379:6379"
   app:
-    build: .
+    # build: .
+    image: openai-api-proxy:latest
     ports:
       - "9000:9000"
     environment:
